@@ -4,6 +4,7 @@ Kitten TTS is an open-source realistic text-to-speech model with just 15 million
 
 *Currently in developer preview*
 
+[Join our discord](https://discord.gg/upcyF5s6)
 
 
 ## ✨ Features
@@ -31,7 +32,9 @@ pip install https://github.com/KittenML/KittenTTS/releases/download/0.1/kittentt
 from kittentts import KittenTTS
 m = KittenTTS("KittenML/kitten-tts-nano-0.1")
 
-audio = m.generate("This high quality TTS model works without a GPU")
+audio = m.generate("This high quality TTS model works without a GPU", voice='expr-voice-2-f' )
+
+# available_voices : [  'expr-voice-2-m', 'expr-voice-2-f', 'expr-voice-3-m', 'expr-voice-3-f',  'expr-voice-4-m', 'expr-voice-4-f', 'expr-voice-5-m', 'expr-voice-5-f' ]
 
 # Save the audio
 import soundfile as sf
