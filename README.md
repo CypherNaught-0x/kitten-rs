@@ -20,7 +20,7 @@ Kitten TTS is an open-source realistic text-to-speech model with just 15 million
 ### Installation
 
 ```
-pip install kittentts
+pip install https://github.com/KittenML/KittenTTS/releases/download/0.1/kittentts-0.1.0-py3-none-any.whl
 ```
 
 
