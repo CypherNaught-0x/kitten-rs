@@ -3,7 +3,13 @@ name = "kittentts-cli"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+coreml = ["kittentts-lib/coreml"]
+cuda = ["kittentts-lib/cuda"]
+directml = ["kittentts-lib/directml"]
+
 [dependencies]
-kittentts-lib = {path="../"}
+kittentts-lib = { path = "../" }
 anyhow = "1.0.98"
 clap = { version = "4.5.43", features = ["derive"] }

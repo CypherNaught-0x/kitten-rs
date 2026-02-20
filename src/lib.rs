@@ -5,20 +5,34 @@ use std::{
     path::Path,
 };
 
-use ndarray::{Array1, Array2, ArrayView1, Axis, s};
+use ndarray::{Array1, Array2, ArrayD, Axis, Ix1, Ix2, s};
 use npyz::npz::NpzArchive;
 use ort::{
-    session::{Session, builder::GraphOptimizationLevel},
-    value::Tensor,
+    execution_providers::ExecutionProviderDispatch,
+    session::{Session, builder::GraphOptimizationLevel, builder::SessionBuilder},
+    value::{DynValue, Tensor},
 };
 use phonemize::Phonemizer;
+use preprocess::{TextPreprocessor, basic_english_tokenize, chunk_text};
 use thiserror::Error;
 
+#[cfg(feature = "cuda")]
+use ort::execution_providers::CUDAExecutionProvider;
+#[cfg(feature = "coreml")]
+use ort::execution_providers::CoreMLExecutionProvider;
+#[cfg(feature = "directml")]
+use ort::execution_providers::DirectMLExecutionProvider;
+
 pub mod phonemize;
+pub mod preprocess;
 pub mod wav;
 
 static MODEL: &[u8] = include_bytes!("../model-files/kitten_tts_nano_v0_1.onnx");
 static VOICES: &[u8] = include_bytes!("../model-files/voices.npz");
+
+const DEFAULT_CHUNK_MAX_LEN: usize = 400;
+const STYLE_DIM: usize = 256;
+const TRAILING_TRIM_SAMPLES: usize = 5000;
 
 #[derive(Error, Debug, Clone)]
 pub enum KittenError {
@@ -28,6 +42,36 @@ pub enum KittenError {
     ModelExecute(String),
     #[error("failed to save model result: {0}")]
     ModelResultSave(String),
+}
+
+#[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
+pub enum OrtProvider {
+    #[default]
+    Auto,
+    Cpu,
+    #[cfg(feature = "coreml")]
+    CoreMl,
+    #[cfg(feature = "cuda")]
+    Cuda,
+    #[cfg(all(feature = "directml", target_os = "windows"))]
+    DirectMl,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GenerateOptions {
+    pub speed: f32,
+    pub clean_text: bool,
+    pub max_chunk_len: usize,
+}
+
+impl Default for GenerateOptions {
+    fn default() -> Self {
+        Self {
+            speed: 1.0,
+            clean_text: true,
+            max_chunk_len: DEFAULT_CHUNK_MAX_LEN,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -65,8 +109,10 @@ pub type KittenTokens = HashMap<char, i64>;
 #[derive(Debug)]
 pub struct KittenModel {
     model: Session,
-    voice: Array1<f32>,
+    voice: Array2<f32>,
+    voice_speed_prior: f32,
     phonemizer: Phonemizer,
+    preprocessor: TextPreprocessor,
     tokens: KittenTokens,
 }
 
@@ -260,12 +306,26 @@ impl KittenModel {
         dictionary_path: P,
         voice: KittenVoice,
     ) -> Result<Self, KittenError> {
-        let model = Session::builder()
-            .map_err(|e| KittenError::ModelLoad(e.to_string()))?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| KittenError::ModelLoad(e.to_string()))?
+        Self::model_from_files_with_provider(
+            model_path,
+            voices_path,
+            dictionary_path,
+            voice,
+            OrtProvider::Auto,
+        )
+    }
+
+    pub fn model_from_files_with_provider<P: AsRef<Path>>(
+        model_path: P,
+        voices_path: P,
+        dictionary_path: P,
+        voice: KittenVoice,
+        provider: OrtProvider,
+    ) -> Result<Self, KittenError> {
+        let model = Self::session_builder(provider)?
             .commit_from_file(model_path)
             .map_err(|e| KittenError::ModelLoad(e.to_string()))?;
+
         let mut voices_npz =
             NpzArchive::open(voices_path).map_err(|e| KittenError::ModelLoad(e.to_string()))?;
         let phonemizer = Phonemizer::from_file(dictionary_path)
@@ -275,17 +335,21 @@ impl KittenModel {
     }
 
     pub fn model_builtin(voice: KittenVoice) -> Result<Self, KittenError> {
-        let model = Session::builder()
-            .map_err(|e| KittenError::ModelLoad(e.to_string()))?
-            .with_optimization_level(GraphOptimizationLevel::Level3)
-            .map_err(|e| KittenError::ModelLoad(e.to_string()))?
+        Self::model_builtin_with_provider(voice, OrtProvider::Auto)
+    }
+
+    pub fn model_builtin_with_provider(
+        voice: KittenVoice,
+        provider: OrtProvider,
+    ) -> Result<Self, KittenError> {
+        let model = Self::session_builder(provider)?
             .commit_from_memory(MODEL)
             .map_err(|e| KittenError::ModelLoad(e.to_string()))?;
         let mut reader = Cursor::new(VOICES);
         let mut voices_npz =
             NpzArchive::new(&mut reader).map_err(|e| KittenError::ModelLoad(e.to_string()))?;
-
         let phonemizer = Phonemizer::new().map_err(|e| KittenError::ModelLoad(e.to_string()))?;
+
         Self::new(voice, &mut voices_npz, model, phonemizer)
     }
 
@@ -303,51 +367,151 @@ impl KittenModel {
             voice_raw
         } else {
             return Err(KittenError::ModelLoad(
-                "Failed to load npy voice file from npz archive".to_string(),
+                "failed to load npy voice file from npz archive".to_string(),
             ));
         };
 
-        let voice_data: Array1<f32> = voice_raw_array
+        let voice_values: Vec<f32> = voice_raw_array
             .data::<f32>()
             .map_err(|e| KittenError::ModelLoad(e.to_string()))?
             .flatten()
             .collect();
+
+        if voice_values.is_empty() || voice_values.len() % STYLE_DIM != 0 {
+            return Err(KittenError::ModelLoad(
+                "invalid voice embedding shape, expected (N, 256)".to_string(),
+            ));
+        }
+
+        let rows = voice_values.len() / STYLE_DIM;
+        let voice_data = Array2::from_shape_vec((rows, STYLE_DIM), voice_values)
+            .map_err(|e| KittenError::ModelLoad(e.to_string()))?;
         let tokens = KittenModel::get_tokens();
 
         Ok(Self {
             model,
             voice: voice_data,
+            voice_speed_prior: 1.0,
             phonemizer,
+            preprocessor: TextPreprocessor::default(),
             tokens,
         })
     }
 
+    pub fn with_speed_prior(mut self, speed_prior: f32) -> Self {
+        self.voice_speed_prior = speed_prior.max(0.01);
+        self
+    }
+
+    pub fn with_preprocessor(mut self, preprocessor: TextPreprocessor) -> Self {
+        self.preprocessor = preprocessor;
+        self
+    }
+
     pub fn generate(&mut self, text: String) -> Result<(Array1<f32>, Array1<i64>), KittenError> {
-        let phonems: Vec<String> = text
-            .split_whitespace()
-            .flat_map(|word| self.phonemizer.phonemize(word))
-            .collect();
-        let phonemized = phonems.join(" ");
-        self.generate_from_phonems(phonemized)
+        self.generate_with_options(text, GenerateOptions::default())
+    }
+
+    pub fn generate_with_options(
+        &mut self,
+        text: String,
+        options: GenerateOptions,
+    ) -> Result<(Array1<f32>, Array1<i64>), KittenError> {
+        let processed_text = if options.clean_text {
+            self.preprocessor.process(text.as_str())
+        } else {
+            text
+        };
+        let chunks = chunk_text(processed_text.as_str(), options.max_chunk_len.max(1));
+        if chunks.is_empty() {
+            return Err(KittenError::ModelExecute(
+                "cannot synthesize empty text".to_string(),
+            ));
+        }
+
+        let mut waveform = Vec::new();
+        let mut durations = Vec::new();
+        let speed = options.speed.max(0.01) * self.voice_speed_prior;
+        for chunk in chunks {
+            let (chunk_waveform, chunk_durations) =
+                self.generate_single_chunk(chunk.as_str(), speed)?;
+            waveform.extend(chunk_waveform.iter().copied());
+            durations.extend(chunk_durations.iter().copied());
+        }
+
+        Ok((Array1::from(waveform), Array1::from(durations)))
     }
 
     pub fn generate_from_phonems(
         &mut self,
         phonems: String,
     ) -> Result<(Array1<f32>, Array1<i64>), KittenError> {
+        self.generate_from_phonems_with_speed(phonems.as_str(), self.voice_speed_prior)
+    }
+
+    fn generate_single_chunk(
+        &mut self,
+        text: &str,
+        speed: f32,
+    ) -> Result<(Array1<f32>, Array1<i64>), KittenError> {
+        let phonemized = self.phonemize_text(text);
+        self.generate_from_phonems_with_speed(phonemized.as_str(), speed)
+    }
+
+    fn phonemize_text(&self, text: &str) -> String {
+        basic_english_tokenize(text)
+            .into_iter()
+            .filter_map(|token| {
+                if token.len() == 1 {
+                    let ch = token.chars().next()?;
+                    if !ch.is_alphanumeric() && self.tokens.contains_key(&ch) {
+                        return Some(token);
+                    }
+                }
+
+                if let Some(phonemized) = self.phonemizer.phonemize(token.as_str()) {
+                    return Some(phonemized);
+                }
+
+                if token.chars().all(|ch| self.tokens.contains_key(&ch)) {
+                    Some(token)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    fn style_for_text_len(&self, text_len: usize) -> Array2<f32> {
+        let row_idx = text_len.min(self.voice.nrows().saturating_sub(1));
+        self.voice.slice(s![row_idx..=row_idx, ..]).to_owned()
+    }
+
+    fn generate_from_phonems_with_speed(
+        &mut self,
+        phonems: &str,
+        speed: f32,
+    ) -> Result<(Array1<f32>, Array1<i64>), KittenError> {
         let text_array: Array1<i64> = phonems
             .chars()
-            .flat_map(|c| self.tokens.get(&c))
-            .cloned()
+            .filter_map(|c| self.tokens.get(&c))
+            .copied()
             .collect();
+
+        if text_array.is_empty() {
+            return Err(KittenError::ModelExecute(
+                "phoneme sequence produced zero tokens".to_string(),
+            ));
+        }
 
         let text_input: Array2<i64> = text_array.insert_axis(Axis(0));
         let text_tensor =
             Tensor::from_array(text_input).map_err(|e| KittenError::ModelExecute(e.to_string()))?;
-        let style_input: Array2<f32> = self.voice.clone().insert_axis(Axis(0));
-        let style_tensor = Tensor::from_array(style_input)
+
+        let style_tensor = Tensor::from_array(self.style_for_text_len(phonems.chars().count()))
             .map_err(|e| KittenError::ModelExecute(e.to_string()))?;
-        let speed_tensor = Tensor::from_array(Array1::from_vec(vec![1.0_f32]))
+        let speed_tensor = Tensor::from_array(Array1::from_vec(vec![speed.max(0.01)]))
             .map_err(|e| KittenError::ModelExecute(e.to_string()))?;
 
         let outputs = self
@@ -359,23 +523,95 @@ impl KittenModel {
             ])
             .map_err(|e| KittenError::ModelExecute(e.to_string()))?;
 
-        let waveform: ArrayView1<f32> = outputs["waveform"]
+        let mut waveform = Self::extract_f32(&outputs["waveform"])?;
+        let duration = Self::extract_i64(&outputs["duration"])?;
+
+        if waveform.len() > TRAILING_TRIM_SAMPLES {
+            let keep = waveform.len() - TRAILING_TRIM_SAMPLES;
+            waveform = waveform.slice(s![..keep]).to_owned();
+        }
+
+        Ok((waveform, duration))
+    }
+
+    fn extract_f32(value: &DynValue) -> Result<Array1<f32>, KittenError> {
+        let array: ArrayD<f32> = value
             .try_extract_array::<f32>()
             .map_err(|e| KittenError::ModelExecute(e.to_string()))?
-            .into_dimensionality()
-            .map_err(|e| KittenError::ModelExecute(e.to_string()))?;
-        let duration: ArrayView1<i64> = outputs["duration"]
+            .to_owned();
+
+        match array.ndim() {
+            1 => array
+                .into_dimensionality::<Ix1>()
+                .map_err(|e| KittenError::ModelExecute(e.to_string())),
+            2 => array
+                .into_dimensionality::<Ix2>()
+                .map(|a| a.index_axis(Axis(0), 0).to_owned())
+                .map_err(|e| KittenError::ModelExecute(e.to_string())),
+            _ => Err(KittenError::ModelExecute(
+                "unexpected waveform tensor rank".to_string(),
+            )),
+        }
+    }
+
+    fn extract_i64(value: &DynValue) -> Result<Array1<i64>, KittenError> {
+        let array: ArrayD<i64> = value
             .try_extract_array::<i64>()
             .map_err(|e| KittenError::ModelExecute(e.to_string()))?
-            .into_dimensionality()
-            .map_err(|e| KittenError::ModelExecute(e.to_string()))?;
+            .to_owned();
 
-        let mut padded = Array1::zeros(waveform.len() + 2);
-        padded
-            .slice_mut(s![1..waveform.len() + 1])
-            .assign(&waveform);
+        match array.ndim() {
+            1 => array
+                .into_dimensionality::<Ix1>()
+                .map_err(|e| KittenError::ModelExecute(e.to_string())),
+            2 => array
+                .into_dimensionality::<Ix2>()
+                .map(|a| a.index_axis(Axis(0), 0).to_owned())
+                .map_err(|e| KittenError::ModelExecute(e.to_string())),
+            _ => Err(KittenError::ModelExecute(
+                "unexpected duration tensor rank".to_string(),
+            )),
+        }
+    }
 
-        Ok((padded, duration.to_owned()))
+    fn session_builder(provider: OrtProvider) -> Result<SessionBuilder, KittenError> {
+        let mut builder = Session::builder()
+            .map_err(|e| KittenError::ModelLoad(e.to_string()))?
+            .with_optimization_level(GraphOptimizationLevel::Level3)
+            .map_err(|e| KittenError::ModelLoad(e.to_string()))?;
+
+        let providers = Self::execution_providers(provider);
+        if !providers.is_empty() {
+            builder = builder
+                .with_execution_providers(providers)
+                .map_err(|e| KittenError::ModelLoad(e.to_string()))?;
+        }
+
+        Ok(builder)
+    }
+
+    fn execution_providers(provider: OrtProvider) -> Vec<ExecutionProviderDispatch> {
+        match provider {
+            OrtProvider::Auto => {
+                let mut providers = Vec::new();
+                #[cfg(all(feature = "coreml", target_vendor = "apple", target_arch = "aarch64"))]
+                {
+                    providers.push(CoreMLExecutionProvider::default().build());
+                }
+                #[cfg(all(feature = "directml", target_os = "windows"))]
+                {
+                    providers.push(DirectMLExecutionProvider::default().build());
+                }
+                providers
+            }
+            OrtProvider::Cpu => Vec::new(),
+            #[cfg(feature = "coreml")]
+            OrtProvider::CoreMl => vec![CoreMLExecutionProvider::default().build()],
+            #[cfg(feature = "cuda")]
+            OrtProvider::Cuda => vec![CUDAExecutionProvider::default().build()],
+            #[cfg(all(feature = "directml", target_os = "windows"))]
+            OrtProvider::DirectMl => vec![DirectMLExecutionProvider::default().build()],
+        }
     }
 }
 
@@ -418,9 +654,10 @@ mod tests {
     fn generate() {
         let model = KittenModel::model_builtin(KittenVoice::default());
         assert_eq!(model.is_ok(), true);
-        let res = model
-            .unwrap()
-            .generate("This high quality TTS model works without a GPU".to_string());
+        let res = model.unwrap().generate(
+            "This high quality TTS model works without a GPU. It handles 2026 text cleanly."
+                .to_string(),
+        );
         assert_eq!(res.is_ok(), true);
     }
 
