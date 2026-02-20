@@ -5,6 +5,7 @@ use std::{
     path::Path,
 };
 
+use models::{RemoteKittenModel, ensure_model_downloaded};
 use ndarray::{Array1, Array2, ArrayD, Axis, Ix1, Ix2, s};
 use npyz::npz::NpzArchive;
 use ort::{
@@ -23,6 +24,7 @@ use ort::execution_providers::CoreMLExecutionProvider;
 #[cfg(feature = "directml")]
 use ort::execution_providers::DirectMLExecutionProvider;
 
+pub mod models;
 pub mod phonemize;
 pub mod preprocess;
 pub mod wav;
@@ -38,6 +40,8 @@ const TRAILING_TRIM_SAMPLES: usize = 5000;
 pub enum KittenError {
     #[error("failed to load model: {0}")]
     ModelLoad(String),
+    #[error("failed to download model: {0}")]
+    ModelDownload(String),
     #[error("failed to execute model: {0}")]
     ModelExecute(String),
     #[error("failed to save model result: {0}")]
@@ -353,6 +357,41 @@ impl KittenModel {
         Self::new(voice, &mut voices_npz, model, phonemizer)
     }
 
+    pub fn model_latest(voice: KittenVoice) -> Result<Self, KittenError> {
+        Self::model_latest_with_provider(voice, OrtProvider::Auto)
+    }
+
+    pub fn model_latest_with_provider(
+        voice: KittenVoice,
+        provider: OrtProvider,
+    ) -> Result<Self, KittenError> {
+        Self::model_remote_with_provider(voice, provider, RemoteKittenModel::default())
+    }
+
+    pub fn model_remote_with_provider(
+        voice: KittenVoice,
+        provider: OrtProvider,
+        remote_model: RemoteKittenModel,
+    ) -> Result<Self, KittenError> {
+        let assets = ensure_model_downloaded(remote_model)
+            .map_err(|e| KittenError::ModelDownload(e.to_string()))?;
+
+        let model = Self::session_builder(provider)?
+            .commit_from_file(&assets.model_path)
+            .map_err(|e| KittenError::ModelLoad(e.to_string()))?;
+        let mut voices_npz = NpzArchive::open(&assets.voices_path)
+            .map_err(|e| KittenError::ModelLoad(e.to_string()))?;
+        let phonemizer = Phonemizer::new().map_err(|e| KittenError::ModelLoad(e.to_string()))?;
+
+        let voice_key = voice.to_string();
+        let mut out = Self::new(voice, &mut voices_npz, model, phonemizer)?;
+        if let Some(speed_prior) = assets.speed_priors.get(voice_key.as_str()) {
+            out = out.with_speed_prior(*speed_prior);
+        }
+
+        Ok(out)
+    }
+
     pub fn new<R: io::Read + io::Seek>(
         voice: KittenVoice,
         npz: &mut NpzArchive<R>,
@@ -593,6 +632,7 @@ impl KittenModel {
     fn execution_providers(provider: OrtProvider) -> Vec<ExecutionProviderDispatch> {
         match provider {
             OrtProvider::Auto => {
+                #[allow(unused_mut)]
                 let mut providers = Vec::new();
                 #[cfg(all(feature = "coreml", target_vendor = "apple", target_arch = "aarch64"))]
                 {

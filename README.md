@@ -1,17 +1,32 @@
 # Kitten TTS Rust Port
 
-Rust port of [KittenML/KittenTTS](https://github.com/KittenML/KittenTTS) with a library crate and CLI.
+Rust port of [KittenML/KittenTTS](https://github.com/KittenML/KittenTTS) with library and CLI support.
+
+## Highlights
+
+- Auto-download + cache of newest `0.8` Hugging Face models.
+- Default model is `nano-int8` (`KittenML/kitten-tts-nano-0.8-int8`).
+- CLI model selection: `nano-int8`, `nano-fp32`, `micro`, `mini`.
+- Execution provider selection:
+  - `auto`
+  - `cpu`
+  - `coreml` (feature `coreml`)
+  - `cuda` (feature `cuda`)
+  - `directml` (feature `directml`, Windows only)
 
 ## CLI
 
 ```bash
-# CPU/default build
+# Default: downloads/uses newest 0.8 nano-int8 model
 cargo run -p kittentts-cli -- "This high quality TTS model works without a GPU" --wav out.wav
 
-# Use explicit provider
+# Pick a specific model
+cargo run -p kittentts-cli -- "hello" --wav out.wav --model mini
+
+# Use explicit execution provider
 cargo run -p kittentts-cli -- "hello" --wav out.wav --provider cpu
 
-# Control speed and text preprocessing
+# Speed + preprocessing controls
 cargo run -p kittentts-cli -- "GPT-3 is 50% faster in 2026" --wav out.wav --speed 1.05 --clean-text true
 ```
 
@@ -38,7 +53,7 @@ cargo run -p kittentts-cli --features directml -- "hello from directml" --wav ou
 ```rust
 use kittentts_lib::{GenerateOptions, KittenModel, KittenVoice, OrtProvider, wav};
 
-let mut model = KittenModel::model_builtin_with_provider(KittenVoice::default(), OrtProvider::Auto)?;
+let mut model = KittenModel::model_latest_with_provider(KittenVoice::default(), OrtProvider::Auto)?;
 let (waveform, _duration) = model.generate_with_options(
     "This high quality TTS model works without a GPU in 2026".to_string(),
     GenerateOptions::default(),

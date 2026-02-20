@@ -5,7 +5,9 @@ use std::{
 
 use anyhow::{Result, bail};
 use clap::{Parser, ValueEnum};
-use kittentts_lib::{GenerateOptions, KittenModel, KittenVoice, OrtProvider, wav};
+use kittentts_lib::{
+    GenerateOptions, KittenModel, KittenVoice, OrtProvider, models::RemoteKittenModel, wav,
+};
 
 #[derive(Clone, Debug, ValueEnum)]
 enum ProviderArg {
@@ -34,6 +36,25 @@ impl From<ProviderArg> for OrtProvider {
     }
 }
 
+#[derive(Clone, Debug, ValueEnum)]
+enum ModelArg {
+    NanoInt8,
+    NanoFp32,
+    Micro,
+    Mini,
+}
+
+impl From<ModelArg> for RemoteKittenModel {
+    fn from(value: ModelArg) -> Self {
+        match value {
+            ModelArg::NanoInt8 => RemoteKittenModel::NanoInt8,
+            ModelArg::NanoFp32 => RemoteKittenModel::NanoFp32,
+            ModelArg::Micro => RemoteKittenModel::Micro,
+            ModelArg::Mini => RemoteKittenModel::Mini,
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
@@ -48,6 +69,8 @@ struct Cli {
     speed: f32,
     #[arg(long, default_value_t = true)]
     clean_text: bool,
+    #[arg(long, value_enum, default_value_t = ModelArg::NanoInt8)]
+    model: ModelArg,
 }
 
 fn main() -> Result<()> {
@@ -70,8 +93,11 @@ fn main() -> Result<()> {
         }
     };
 
-    let mut model =
-        KittenModel::model_builtin_with_provider(KittenVoice::default(), cli.provider.into())?;
+    let mut model = KittenModel::model_remote_with_provider(
+        KittenVoice::default(),
+        cli.provider.into(),
+        cli.model.into(),
+    )?;
     let out = if cli.phonems {
         model.generate_from_phonems(text.clone())?
     } else {
