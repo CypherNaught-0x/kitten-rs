@@ -34,7 +34,7 @@ static VOICES: &[u8] = include_bytes!("../model-files/voices.npz");
 
 const DEFAULT_CHUNK_MAX_LEN: usize = 400;
 const STYLE_DIM: usize = 256;
-const TRAILING_TRIM_SAMPLES: usize = 5000;
+const TRAILING_TRIM_SAMPLES: usize = 0;
 
 #[derive(Error, Debug, Clone)]
 pub enum KittenError {
