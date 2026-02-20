@@ -12,7 +12,7 @@ pub fn save_array1_f32_as_wav<P: AsRef<Path>>(
     sample_rate: Option<u32>,
 ) -> Result<(), io::Error> {
     let mut file = File::create(out_path)?;
-    let sample_rate = sample_rate.unwrap_or(22000);
+    let sample_rate = sample_rate.unwrap_or(24000);
 
     let num_samples = data.len() as u32;
     let num_channels = 1u16;

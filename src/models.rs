@@ -11,6 +11,16 @@ use serde::Deserialize;
 use thiserror::Error;
 
 const HUGGINGFACE_ROOT: &str = "https://huggingface.co";
+const KNOWN_VOICES: [&str; 8] = [
+    "expr-voice-2-m",
+    "expr-voice-2-f",
+    "expr-voice-3-m",
+    "expr-voice-3-f",
+    "expr-voice-4-m",
+    "expr-voice-4-f",
+    "expr-voice-5-m",
+    "expr-voice-5-f",
+];
 
 #[derive(Debug, Clone, Copy, Default, Eq, PartialEq)]
 pub enum RemoteKittenModel {
@@ -46,6 +56,68 @@ pub struct DownloadedModelAssets {
     pub model_path: PathBuf,
     pub voices_path: PathBuf,
     pub speed_priors: HashMap<String, f32>,
+    pub voice_aliases: HashMap<String, String>,
+}
+
+impl DownloadedModelAssets {
+    pub fn available_voices(&self) -> Vec<String> {
+        let mut voices: Vec<String> = KNOWN_VOICES.iter().map(|v| (*v).to_string()).collect();
+        for voice in self.voice_aliases.values() {
+            if !voices.contains(voice) {
+                voices.push(voice.clone());
+            }
+        }
+        for voice in self.speed_priors.keys() {
+            if !voices.contains(voice) {
+                voices.push(voice.clone());
+            }
+        }
+        voices.sort();
+        voices
+    }
+
+    pub fn resolve_voice_name(&self, requested: &str) -> String {
+        let raw = requested.trim();
+        if raw.is_empty() {
+            return "expr-voice-5-m".to_string();
+        }
+        if let Some(voice) = self.voice_aliases.get(raw) {
+            return voice.clone();
+        }
+        if let Some((_, voice)) = self
+            .voice_aliases
+            .iter()
+            .find(|(alias, _)| alias.eq_ignore_ascii_case(raw))
+        {
+            return voice.clone();
+        }
+        if KNOWN_VOICES.iter().any(|v| v.eq_ignore_ascii_case(raw)) {
+            return raw.to_lowercase();
+        }
+        if raw.len() == 3 && raw.as_bytes().get(1) == Some(&b'-') {
+            return format!("expr-voice-{}", raw.to_lowercase());
+        }
+        raw.to_string()
+    }
+
+    pub fn speed_prior_for(&self, requested: &str, resolved_voice: &str) -> Option<f32> {
+        self.speed_priors
+            .get(resolved_voice)
+            .copied()
+            .or_else(|| self.speed_priors.get(requested).copied())
+            .or_else(|| {
+                self.speed_priors
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case(resolved_voice))
+                    .map(|(_, value)| *value)
+            })
+            .or_else(|| {
+                self.speed_priors
+                    .iter()
+                    .find(|(key, _)| key.eq_ignore_ascii_case(requested))
+                    .map(|(_, value)| *value)
+            })
+    }
 }
 
 #[derive(Debug, Error)]
@@ -66,6 +138,8 @@ struct ModelConfig {
     voices: String,
     #[serde(default)]
     speed_priors: HashMap<String, f32>,
+    #[serde(default)]
+    voice_aliases: HashMap<String, String>,
 }
 
 fn default_model_file() -> String {
@@ -122,6 +196,7 @@ pub fn ensure_model_downloaded(
         model_path,
         voices_path,
         speed_priors: config.speed_priors,
+        voice_aliases: config.voice_aliases,
     })
 }
 
@@ -191,12 +266,39 @@ fn download_if_missing(url: &str, dst: &Path) -> Result<(), ModelDownloadError> 
 
 #[cfg(test)]
 mod tests {
-    use super::{RemoteKittenModel, hf_resolve_url};
+    use std::collections::HashMap;
+
+    use super::{DownloadedModelAssets, RemoteKittenModel, hf_resolve_url};
 
     #[test]
     fn resolve_urls_are_main_branch() {
         let repo = RemoteKittenModel::NanoInt8.repo_id();
         let url = hf_resolve_url(repo, "config.json");
         assert!(url.contains("/resolve/main/config.json"));
+    }
+
+    #[test]
+    fn resolve_voice_prefers_aliases() {
+        let assets = DownloadedModelAssets {
+            model_path: "model.onnx".into(),
+            voices_path: "voices.npz".into(),
+            speed_priors: HashMap::new(),
+            voice_aliases: HashMap::from([("Jasper".to_string(), "expr-voice-5-m".to_string())]),
+        };
+        assert_eq!(assets.resolve_voice_name("Jasper"), "expr-voice-5-m");
+        assert_eq!(assets.resolve_voice_name("jasper"), "expr-voice-5-m");
+        assert_eq!(assets.resolve_voice_name("2-f"), "expr-voice-2-f");
+    }
+
+    #[test]
+    fn speed_prior_lookup_uses_resolved_voice() {
+        let assets = DownloadedModelAssets {
+            model_path: "model.onnx".into(),
+            voices_path: "voices.npz".into(),
+            speed_priors: HashMap::from([("expr-voice-5-m".to_string(), 1.2_f32)]),
+            voice_aliases: HashMap::from([("Jasper".to_string(), "expr-voice-5-m".to_string())]),
+        };
+        let speed = assets.speed_prior_for("Jasper", "expr-voice-5-m");
+        assert_eq!(speed, Some(1.2_f32));
     }
 }

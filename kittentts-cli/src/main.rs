@@ -6,7 +6,10 @@ use std::{
 use anyhow::{Result, bail};
 use clap::{Parser, ValueEnum};
 use kittentts_lib::{
-    GenerateOptions, KittenModel, KittenVoice, OrtProvider, models::RemoteKittenModel, wav,
+    GenerateOptions, KittenModel, OrtProvider,
+    models::{RemoteKittenModel, ensure_model_downloaded},
+    phonemize::PhonemizerBackend,
+    wav,
 };
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -55,12 +58,29 @@ impl From<ModelArg> for RemoteKittenModel {
     }
 }
 
+#[derive(Clone, Debug, ValueEnum)]
+enum PhonemizerArg {
+    Rust,
+    Espeakng,
+    Misaki,
+}
+
+impl From<PhonemizerArg> for PhonemizerBackend {
+    fn from(value: PhonemizerArg) -> Self {
+        match value {
+            PhonemizerArg::Rust => PhonemizerBackend::Rust,
+            PhonemizerArg::Espeakng => PhonemizerBackend::EspeakNg,
+            PhonemizerArg::Misaki => PhonemizerBackend::Misaki,
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
     text: Option<String>,
     #[arg(short, long, value_name = "OUT_WAV_FILE")]
-    wav: PathBuf,
+    wav: Option<PathBuf>,
     #[arg(short, long)]
     phonems: bool,
     #[arg(long, value_enum, default_value_t = ProviderArg::Auto)]
@@ -71,10 +91,35 @@ struct Cli {
     clean_text: bool,
     #[arg(long, value_enum, default_value_t = ModelArg::NanoInt8)]
     model: ModelArg,
+    #[arg(long, default_value = "expr-voice-5-m")]
+    voice: String,
+    #[arg(long)]
+    list_voices: bool,
+    #[arg(long, value_enum, default_value_t = PhonemizerArg::Rust)]
+    phonemizer: PhonemizerArg,
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
+    let remote_model: RemoteKittenModel = cli.model.into();
+
+    if cli.list_voices {
+        let assets = ensure_model_downloaded(remote_model)?;
+        println!("Voices:");
+        for voice in assets.available_voices() {
+            println!("  {voice}");
+        }
+        if !assets.voice_aliases.is_empty() {
+            println!("\nVoice aliases:");
+            let mut aliases: Vec<_> = assets.voice_aliases.iter().collect();
+            aliases.sort_by(|a, b| a.0.cmp(b.0));
+            for (alias, voice) in aliases {
+                println!("  {alias} -> {voice}");
+            }
+        }
+        return Ok(());
+    }
+
     let text = match cli.text {
         Some(text) => text,
         None => {
@@ -93,11 +138,9 @@ fn main() -> Result<()> {
         }
     };
 
-    let mut model = KittenModel::model_remote_with_provider(
-        KittenVoice::default(),
-        cli.provider.into(),
-        cli.model.into(),
-    )?;
+    let mut model =
+        KittenModel::model_remote_with_voice_name(&cli.voice, cli.provider.into(), remote_model)?
+            .with_phonemizer_backend(cli.phonemizer.into())?;
     let out = if cli.phonems {
         model.generate_from_phonems(text.clone())?
     } else {
@@ -110,7 +153,12 @@ fn main() -> Result<()> {
             },
         )?
     };
-    wav::save_array1_f32_as_wav(&out.0, cli.wav, None)?;
+    let out_wav = cli.wav.ok_or_else(|| {
+        anyhow::anyhow!(
+            "Missing required --wav output path.\nExample: kittentts-cli \"hello\" --wav out.wav"
+        )
+    })?;
+    wav::save_array1_f32_as_wav(&out.0, out_wav, None)?;
 
     println!("Finished!");
     Ok(())

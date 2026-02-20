@@ -13,7 +13,7 @@ use ort::{
     session::{Session, builder::GraphOptimizationLevel, builder::SessionBuilder},
     value::{DynValue, Tensor},
 };
-use phonemize::Phonemizer;
+use phonemize::{Phonemizer, PhonemizerBackend};
 use preprocess::{TextPreprocessor, basic_english_tokenize, chunk_text};
 use thiserror::Error;
 
@@ -105,6 +105,22 @@ impl Display for KittenVoice {
         };
 
         write!(f, "expr-voice-{voice_str}")
+    }
+}
+
+impl KittenVoice {
+    pub fn from_model_key(value: &str) -> Option<Self> {
+        match value {
+            "expr-voice-2-m" => Some(Self::TwoM),
+            "expr-voice-2-f" => Some(Self::TwoF),
+            "expr-voice-3-m" => Some(Self::ThreeM),
+            "expr-voice-3-f" => Some(Self::ThreeF),
+            "expr-voice-4-m" => Some(Self::FourM),
+            "expr-voice-4-f" => Some(Self::FourF),
+            "expr-voice-5-m" => Some(Self::FiveM),
+            "expr-voice-5-f" => Some(Self::FiveF),
+            _ => None,
+        }
     }
 }
 
@@ -368,13 +384,42 @@ impl KittenModel {
         Self::model_remote_with_provider(voice, provider, RemoteKittenModel::default())
     }
 
+    pub fn model_latest_with_voice_name(
+        voice_name: &str,
+        provider: OrtProvider,
+    ) -> Result<Self, KittenError> {
+        Self::model_remote_with_voice_name(voice_name, provider, RemoteKittenModel::default())
+    }
+
     pub fn model_remote_with_provider(
         voice: KittenVoice,
         provider: OrtProvider,
         remote_model: RemoteKittenModel,
     ) -> Result<Self, KittenError> {
+        let voice_name = voice.to_string();
+        Self::model_remote_with_voice_name(voice_name.as_str(), provider, remote_model)
+    }
+
+    pub fn model_remote_with_voice_name(
+        voice_name: &str,
+        provider: OrtProvider,
+        remote_model: RemoteKittenModel,
+    ) -> Result<Self, KittenError> {
         let assets = ensure_model_downloaded(remote_model)
             .map_err(|e| KittenError::ModelDownload(e.to_string()))?;
+        let resolved_voice = assets.resolve_voice_name(voice_name);
+        let voice = KittenVoice::from_model_key(resolved_voice.as_str()).ok_or_else(|| {
+            let aliases = assets
+                .voice_aliases
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ");
+            let voices = assets.available_voices().join(", ");
+            KittenError::ModelLoad(format!(
+                "unknown voice '{voice_name}'. Available voices: {voices}. Aliases: {aliases}"
+            ))
+        })?;
 
         let model = Self::session_builder(provider)?
             .commit_from_file(&assets.model_path)
@@ -383,13 +428,20 @@ impl KittenModel {
             .map_err(|e| KittenError::ModelLoad(e.to_string()))?;
         let phonemizer = Phonemizer::new().map_err(|e| KittenError::ModelLoad(e.to_string()))?;
 
-        let voice_key = voice.to_string();
         let mut out = Self::new(voice, &mut voices_npz, model, phonemizer)?;
-        if let Some(speed_prior) = assets.speed_priors.get(voice_key.as_str()) {
-            out = out.with_speed_prior(*speed_prior);
+        if let Some(speed_prior) = assets.speed_prior_for(voice_name, resolved_voice.as_str()) {
+            out = out.with_speed_prior(speed_prior);
         }
 
         Ok(out)
+    }
+
+    pub fn remote_voice_aliases(
+        remote_model: RemoteKittenModel,
+    ) -> Result<HashMap<String, String>, KittenError> {
+        let assets = ensure_model_downloaded(remote_model)
+            .map_err(|e| KittenError::ModelDownload(e.to_string()))?;
+        Ok(assets.voice_aliases)
     }
 
     pub fn new<R: io::Read + io::Seek>(
@@ -447,6 +499,15 @@ impl KittenModel {
         self
     }
 
+    pub fn with_phonemizer_backend(
+        mut self,
+        backend: PhonemizerBackend,
+    ) -> Result<Self, KittenError> {
+        self.phonemizer =
+            Phonemizer::from_backend(backend).map_err(|e| KittenError::ModelLoad(e.to_string()))?;
+        Ok(self)
+    }
+
     pub fn generate(&mut self, text: String) -> Result<(Array1<f32>, Array1<i64>), KittenError> {
         self.generate_with_options(text, GenerateOptions::default())
     }
@@ -485,7 +546,7 @@ impl KittenModel {
         &mut self,
         phonems: String,
     ) -> Result<(Array1<f32>, Array1<i64>), KittenError> {
-        self.generate_from_phonems_with_speed(phonems.as_str(), self.voice_speed_prior)
+        self.generate_from_phonems_with_speed(phonems.as_str(), self.voice_speed_prior, None)
     }
 
     fn generate_single_chunk(
@@ -493,12 +554,27 @@ impl KittenModel {
         text: &str,
         speed: f32,
     ) -> Result<(Array1<f32>, Array1<i64>), KittenError> {
-        let phonemized = self.phonemize_text(text);
-        self.generate_from_phonems_with_speed(phonemized.as_str(), speed)
+        let phonemized = self.phonemize_text(text)?;
+        self.generate_from_phonems_with_speed(
+            phonemized.as_str(),
+            speed,
+            Some(text.chars().count()),
+        )
     }
 
-    fn phonemize_text(&self, text: &str) -> String {
-        basic_english_tokenize(text)
+    fn phonemize_text(&self, text: &str) -> Result<String, KittenError> {
+        if self.phonemizer.supports_text_phonemization() {
+            if let Some(phonemized) = self
+                .phonemizer
+                .phonemize_text(text)
+                .map_err(|e| KittenError::ModelExecute(e.to_string()))?
+            {
+                // Match upstream Python path: tokenize phoneme text, then join with spaces.
+                return Ok(basic_english_tokenize(phonemized.as_str()).join(" "));
+            }
+        }
+
+        Ok(basic_english_tokenize(text)
             .into_iter()
             .filter_map(|token| {
                 if token.len() == 1 {
@@ -519,7 +595,7 @@ impl KittenModel {
                 }
             })
             .collect::<Vec<_>>()
-            .join(" ")
+            .join(" "))
     }
 
     fn style_for_text_len(&self, text_len: usize) -> Array2<f32> {
@@ -531,24 +607,31 @@ impl KittenModel {
         &mut self,
         phonems: &str,
         speed: f32,
+        style_text_len: Option<usize>,
     ) -> Result<(Array1<f32>, Array1<i64>), KittenError> {
-        let text_array: Array1<i64> = phonems
+        let mut token_ids: Vec<i64> = phonems
             .chars()
             .filter_map(|c| self.tokens.get(&c))
             .copied()
             .collect();
 
-        if text_array.is_empty() {
+        if token_ids.is_empty() {
             return Err(KittenError::ModelExecute(
                 "phoneme sequence produced zero tokens".to_string(),
             ));
         }
 
+        // Python implementation prepends/appends token id 0.
+        token_ids.insert(0, 0);
+        token_ids.push(0);
+        let text_array: Array1<i64> = Array1::from(token_ids);
+
         let text_input: Array2<i64> = text_array.insert_axis(Axis(0));
         let text_tensor =
             Tensor::from_array(text_input).map_err(|e| KittenError::ModelExecute(e.to_string()))?;
 
-        let style_tensor = Tensor::from_array(self.style_for_text_len(phonems.chars().count()))
+        let style_len = style_text_len.unwrap_or_else(|| phonems.chars().count());
+        let style_tensor = Tensor::from_array(self.style_for_text_len(style_len))
             .map_err(|e| KittenError::ModelExecute(e.to_string()))?;
         let speed_tensor = Tensor::from_array(Array1::from_vec(vec![speed.max(0.01)]))
             .map_err(|e| KittenError::ModelExecute(e.to_string()))?;
@@ -699,6 +782,24 @@ mod tests {
                 .to_string(),
         );
         assert_eq!(res.is_ok(), true);
+    }
+
+    #[test]
+    fn generate_phrase_keeps_tts_and_gpu_content() {
+        let model = KittenModel::model_builtin(KittenVoice::default());
+        assert_eq!(model.is_ok(), true);
+        let model = model.unwrap();
+        let phonemes = model
+            .phonemize_text("This high quality TTS model works without a GPU")
+            .unwrap();
+        assert!(
+            phonemes.contains("tiːtiːɛs") || phonemes.contains("tˌiːtˌiːˈɛs"),
+            "missing TTS phonemes in: {phonemes}"
+        );
+        assert!(
+            phonemes.contains("dʒiːpiːjuː") || phonemes.contains("dʒˌiːpˌiːjˈuː"),
+            "missing GPU phonemes in: {phonemes}"
+        );
     }
 
     #[test]
